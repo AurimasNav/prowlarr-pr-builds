@@ -108,11 +108,16 @@ jobs:
       with:
         global-json-file: prowlarr/global.json
 
-    - name: Run the PR's indexer tests
+    # Built the way Prowlarr's CI does (build.sh, which also builds the test projects into
+    # _tests); a plain `dotnet test` on the csproj trips the StyleCop rules on unrelated files.
+    - name: Build (linux-x64, with the test projects)
       working-directory: prowlarr
+      run: ./build.sh --backend --framework net10.0 --runtime linux-x64
+
+    - name: Run the PR's indexer tests
+      working-directory: prowlarr/_tests/net10.0/linux-x64/publish
       run: >-
-        dotnet test src/NzbDrone.Core.Test/Prowlarr.Core.Test.csproj
-        -p:Platform=Posix
+        dotnet test Prowlarr.Core.Test.dll
         --filter "FullyQualifiedName~LostFilm"
         --logger "console;verbosity=normal"
 
