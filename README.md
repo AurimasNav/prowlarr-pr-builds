@@ -23,3 +23,4 @@ to build the PR with that patch applied on top (the image tag ends in `-<name>-r
 
 - `pr2765-lostfilm-fixes`: LostFilm (#2765) reuses the session on the mirror after a geo-block
   (no re-login with the used captcha) and parses dates without ru-RU culture data.
+- `pr2765-tests-only`: only the new tests from `pr2765-lostfilm-fixes`, to show they fail without the fix.

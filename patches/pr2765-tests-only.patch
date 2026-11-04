@@ -1,0 +1,119 @@
+diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+index 66709d47f..e8eb7b6b6 100644
+--- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
++++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+@@ -914,5 +914,114 @@ public async Task should_not_throw_when_episode_date_text_has_marker_out_of_orde
+             result.Releases.Should().NotBeEmpty();
+             result.Releases.Should().OnlyContain(r => r.PublishDate > DateTime.Now.AddMinutes(-1));
+         }
++
++        [TestCase("08.04.2022", 2022, 4, 8)]
++        [TestCase("29.09.2013", 2013, 9, 29)]
++        [TestCase("1.5.2020", 2020, 5, 1)]
++        [TestCase("17 декабря 2009", 2009, 12, 17)]
++        [TestCase("01 октября 2013", 2013, 10, 1)]
++        [TestCase(" 30 января 2025 ", 2025, 1, 30)]
++        [TestCase("29 Февраля 2024", 2024, 2, 29)]
++        public void should_parse_lostfilm_dates_without_russian_culture_data(string text, int year, int month, int day)
++        {
++            // Regression: dates were parsed with the ru-RU culture, which silently behaves like the
++            // invariant culture when only English ICU data is installed (e.g. the linuxserver.io
++            // Alpine image), so "08.04.2022" became August 4th and month names fell back to now.
++            LostFilm.ParseRussianDate(text).Should().Be(new DateTime(year, month, day));
++        }
++
++        [TestCase(null)]
++        [TestCase("")]
++        [TestCase("TBA")]
++        [TestCase("31 февраля 2020")]
++        [TestCase("13.13.2020")]
++        [TestCase("17 december 2009")]
++        public void should_not_parse_invalid_lostfilm_dates(string text)
++        {
++            LostFilm.ParseRussianDate(text).Should().BeNull();
++        }
++
++        [Test]
++        public async Task should_reuse_session_on_mirror_instead_of_relogin_when_primary_is_geo_blocked()
++        {
++            // Regression: the mirror probe is sent without the session cookies, so a geo-blocked
++            // page that needs a login came back as the guest version, which triggered a re-login
++            // with the captcha stored in the settings. LostFilm captchas are single-use, so that
++            // login failed ("Captcha is incorrect") and the indexer got disabled even though the
++            // session was still valid. The proven mirror must get the request replayed with the
++            // session instead, without any login.
++            const string geoBlockedPage = "error code: 1026";
++            var guestSeasonsPage = ReadAllText(@"Files/Indexers/LostFilm/shogun_seasons.html");
++            var memberSeasonsPage = guestSeasonsPage.Replace("href=\"/login\"", "href=\"/my\"");
++
++            IDictionary<string, string> storedCookies = new Dictionary<string, string>
++            {
++                { "lf_session", "VALID_SESSION" },
++                { "PHPSESSID", "VALID_PHP" }
++            };
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) => storedCookies = cookies);
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => DateTime.Now.AddDays(30));
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.IsAny<HttpRequest>(), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), "<html><body></body></html>")));
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var body = r.GetContent() ?? string.Empty;
++                    var content = body.Contains("type=login") ? "{\"error\":4,\"result\":\"ok\"}" : ReadAllText(@"Files/Indexers/LostFilm/search_shogun.json");
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), content));
++                });
++
++            MockResponse(HttpMethod.Get, "/v_search.php", ReadAllText(@"Files/Indexers/LostFilm/vsearch_shogun.html"));
++            MockResponse(HttpMethod.Get, "/V/", ReadAllText(@"Files/Indexers/LostFilm/tracker_shogun.html"));
++
++            client.Setup(o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilm.tv" && v.Url.Path == "/series/Shogun/seasons"),
++                    Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/plain" } }, new CookieCollection(), geoBlockedPage, statusCode: HttpStatusCode.UnavailableForLegalReasons)));
++            client.Setup(o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons"),
++                    Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var hasSession = r.Cookies.TryGetValue("lf_session", out var session) && session == "VALID_SESSION";
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), hasSession ? memberSeasonsPage : guestSeasonsPage));
++                });
++
++            var result = await Subject.Fetch(new TvSearchCriteria { SearchTerm = "shogun", Categories = new[] { 5000 } });
++
++            result.Releases.Should().HaveCount(3);
++            result.Releases.Should().OnlyContain(r => r.InfoUrl == "https://www.lostfilmtv5.site/series/Shogun/seasons");
++
++            // No login attempt at all: the stored captcha must not be resubmitted.
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php" && (v.GetContent() ?? string.Empty).Contains("type=login")),
++                    Subject.Definition),
++                Times.Never());
++
++            // The mirror is probed once without the session, then the request is replayed once with it.
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons" && !v.Cookies.ContainsKey("lf_session")),
++                    Subject.Definition),
++                Times.Once());
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons" && v.Cookies.ContainsKey("lf_session")),
++                    Subject.Definition),
++                Times.Once());
++        }
+     }
+ }
