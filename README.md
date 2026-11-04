@@ -8,7 +8,7 @@ The workflow **Build Prowlarr PR image** (run by hand) merges one PR into a Prow
 (default `develop`), builds it with Prowlarr's own `build.sh` for `linux-musl-x64`, runs the
 PR's indexer tests, and pushes `ghcr.io/aurimasnav/prowlarr-pr-builds:pr<number>-<pr sha>-<branch>-<branch sha>`.
 The image is the [linuxserver.io Prowlarr image](https://github.com/linuxserver/docker-prowlarr)
-with Prowlarr swapped for that build.
+with Prowlarr swapped for that build. Before pushing, the image is started once and must report the expected version and list the indexer the PR adds.
 
 The PR's code runs in a job with a read-only token; only the final job, which runs no PR
 code, can push the image.

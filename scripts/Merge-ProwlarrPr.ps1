@@ -29,7 +29,8 @@ try {
         Select-Object -First 1 | ForEach-Object { $_.Matches[0].Groups[1].Value }
     if (-not $major) { throw 'majorVersion not found in azure-pipelines.yml' }
     $version = "$major.$($env:GITHUB_RUN_NUMBER ?? '0')"
-    $tag = "pr$Pr-$($prSha.Substring(0, 7))-$($Base -replace '[^A-Za-z0-9]', '')-$($baseSha.Substring(0, 7))"
+    # The run number keeps every build's tag unique (a tag is never moved to another image).
+    $tag = "pr$Pr-$($prSha.Substring(0, 7))-$($Base -replace '[^A-Za-z0-9]', '')-$($baseSha.Substring(0, 7))-r$($env:GITHUB_RUN_NUMBER ?? '0')"
 
     Write-Output "Base $Base at $baseSha, PR #$Pr at $prSha, version $version, tag $tag"
     if ($env:GITHUB_OUTPUT) {

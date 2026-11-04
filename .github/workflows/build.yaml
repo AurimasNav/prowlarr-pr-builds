@@ -16,6 +16,10 @@ on:
         description: Prowlarr branch to merge the pull request into
         required: true
         default: develop
+      indexer:
+        description: Indexer implementation the PR adds (checked in the image smoke test)
+        required: true
+        default: LostFilm
 
 permissions:
   contents: read
@@ -118,7 +122,7 @@ jobs:
       working-directory: prowlarr/_tests/net10.0/linux-x64/publish
       run: >-
         dotnet test Prowlarr.Core.Test.dll
-        --filter "FullyQualifiedName~LostFilm"
+        --filter "FullyQualifiedName~${{ inputs.indexer }}"
         --logger "console;verbosity=normal"
 
   image:
@@ -147,5 +151,6 @@ jobs:
         BASE_SHA: ${{ needs.build.outputs.base_sha }}
         PR_SHA: ${{ needs.build.outputs.pr_sha }}
         PR: ${{ inputs.pr }}
+        INDEXER: ${{ inputs.indexer }}
         REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: ./scripts/Publish-Image.ps1
