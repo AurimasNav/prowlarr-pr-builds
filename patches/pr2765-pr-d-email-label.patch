@@ -1,0 +1,124 @@
+diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+index 66709d47f..5d69d8c82 100644
+--- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
++++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+@@ -33,7 +33,7 @@ public void Setup()
+                 Settings = new LostFilmSettings
+                 {
+                     BaseUrl = BaseUrl,
+-                    Username = "testuser",
++                    Email = "testuser@example.com",
+                     Password = "testpass"
+                 }
+             };
+@@ -131,6 +131,36 @@ public void should_expose_captcha_as_cardigann_captcha_schema_field()
+             attribute.Order.Should().Be(4);
+         }
+ 
++        [Test]
++        public void should_label_the_login_field_as_email()
++        {
++            // LostFilm logs in with the account's e-mail address, so the field must not say "Username".
++            var attribute = typeof(LostFilmSettings)
++                .GetProperty(nameof(LostFilmSettings.Email))
++                ?.GetCustomAttribute<FieldDefinitionAttribute>(false);
++
++            attribute.Should().NotBeNull();
++            attribute.Label.Should().Be("Email");
++            attribute.Order.Should().Be(2);
++            typeof(LostFilmSettings).GetProperty("Username").Should().BeNull();
++        }
++
++        [Test]
++        public void should_send_the_email_as_the_login_name()
++        {
++            const string anonPage = "<html><body><a href=\"/login\" class=\"link\">Вход</a></body></html>";
++            MockResponse(HttpMethod.Get, "/new", anonPage);
++            MockResponse(HttpMethod.Post, "/ajaxik.php", "{\"error\":3,\"result\":\"ok\"}", "application/json");
++
++            Subject.Test();
++
++            Mocker.GetMock<IIndexerHttpClient>().Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && (v.GetContent() ?? string.Empty).Contains("type=login") && (v.GetContent() ?? string.Empty).Contains("mail=testuser%40example.com")),
++                    Subject.Definition),
++                Times.Once());
++        }
++
+         [Test]
+         public void should_return_captcha_from_checkCaptcha_action()
+         {
+diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmLiveFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmLiveFixture.cs
+index e0eadd9c9..a86ab3625 100644
+--- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmLiveFixture.cs
++++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmLiveFixture.cs
+@@ -82,7 +82,7 @@ public void Setup()
+                 Settings = new LostFilmSettings
+                 {
+                     BaseUrl = BaseUrl,
+-                    Username = Environment.GetEnvironmentVariable("LOSTFILM_USER") ?? "testuser",
++                    Email = Environment.GetEnvironmentVariable("LOSTFILM_USER") ?? "testuser@example.com",
+                     Password = Environment.GetEnvironmentVariable("LOSTFILM_PASSWORD")
+                 }
+             };
+diff --git a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
+index 49f9a53ba..394c69c24 100644
+--- a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
++++ b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
+@@ -10,6 +10,7 @@
+ using System.Web;
+ using AngleSharp.Dom;
+ using AngleSharp.Html.Parser;
++using FluentValidation;
+ using FluentValidation.Results;
+ using Newtonsoft.Json.Linq;
+ using NLog;
+@@ -175,7 +176,7 @@ protected override async Task DoLogin()
+                 .Accept(HttpAccept.Html)
+                 .AddFormParameter("act", "users")
+                 .AddFormParameter("type", "login")
+-                .AddFormParameter("mail", Settings.Username)
++                .AddFormParameter("mail", Settings.Email)
+                 .AddFormParameter("pass", Settings.Password)
+                 .AddFormParameter("rem", "1");
+ 
+@@ -1697,9 +1698,38 @@ public IList<ReleaseInfo> ParseResponse(IndexerResponse indexerResponse)
+         }
+     }
+ 
+-    public class LostFilmSettings : UserPassTorrentBaseSettings
++    public class LostFilmSettingsValidator : NoAuthSettingsValidator<LostFilmSettings>
+     {
++        public LostFilmSettingsValidator()
++        {
++            RuleFor(c => c.Email).NotEmpty();
++            RuleFor(c => c.Password).NotEmpty();
++        }
++    }
++
++    public class LostFilmSettings : NoAuthTorrentBaseSettings
++    {
++        private static readonly LostFilmSettingsValidator Validator = new();
++
++        public LostFilmSettings()
++        {
++            Email = "";
++            Password = "";
++        }
++
++        // LostFilm logs in with the account's e-mail address, not a user name.
++        [FieldDefinition(2, Label = "Email", HelpText = "Site Email", Privacy = PrivacyLevel.UserName)]
++        public string Email { get; set; }
++
++        [FieldDefinition(3, Label = "Password", HelpText = "Site Password", Privacy = PrivacyLevel.Password, Type = FieldType.Password)]
++        public string Password { get; set; }
++
+         [FieldDefinition(4, Label = "CAPTCHA", Type = FieldType.CardigannCaptcha, HelpText = "Enter the code from the captcha image")]
+         public string Captcha { get; set; }
++
++        public override NzbDroneValidationResult Validate()
++        {
++            return new NzbDroneValidationResult(Validator.Validate(this));
++        }
+     }
+ }
