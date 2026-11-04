@@ -1,0 +1,222 @@
+diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+index 66709d47f..69001a59e 100644
+--- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
++++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+@@ -492,6 +492,149 @@ public async Task should_fallback_to_mirror_when_primary_is_geo_blocked()
+                 Times.Exactly(2));
+         }
+ 
++        [Test]
++        public async Task should_reuse_session_on_mirror_instead_of_relogin_when_primary_is_geo_blocked()
++        {
++            // Regression: the mirror probe is sent without the session cookies, so a geo-blocked
++            // page that needs a login came back as the guest version, which triggered a re-login
++            // with the captcha stored in the settings. LostFilm captchas are single-use, so that
++            // login failed ("Captcha is incorrect") and the indexer got disabled even though the
++            // session was still valid. The proven mirror must get the request replayed with the
++            // session instead, without any login.
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "used-captcha";
++
++            const string geoBlockedPage = "error code: 1026";
++            var guestSeasonsPage = ReadAllText(@"Files/Indexers/LostFilm/shogun_seasons.html");
++            var memberSeasonsPage = guestSeasonsPage.Replace("href=\"/login\"", "href=\"/my\"");
++
++            IDictionary<string, string> storedCookies = new Dictionary<string, string>
++            {
++                { "lf_session", "VALID_SESSION" },
++                { "PHPSESSID", "VALID_PHP" }
++            };
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) => storedCookies = cookies);
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => DateTime.Now.AddDays(30));
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.IsAny<HttpRequest>(), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), "<html><body></body></html>")));
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var body = r.GetContent() ?? string.Empty;
++                    var content = body.Contains("type=login") ? "{\"error\":4,\"result\":\"ok\"}" : ReadAllText(@"Files/Indexers/LostFilm/search_shogun.json");
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), content));
++                });
++
++            MockResponse(HttpMethod.Get, "/v_search.php", ReadAllText(@"Files/Indexers/LostFilm/vsearch_shogun.html"));
++            MockResponse(HttpMethod.Get, "/V/", ReadAllText(@"Files/Indexers/LostFilm/tracker_shogun.html"));
++
++            client.Setup(o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilm.tv" && v.Url.Path == "/series/Shogun/seasons"),
++                    Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/plain" } }, new CookieCollection(), geoBlockedPage, statusCode: HttpStatusCode.UnavailableForLegalReasons)));
++            client.Setup(o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons"),
++                    Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var hasSession = r.Cookies.TryGetValue("lf_session", out var session) && session == "VALID_SESSION";
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), hasSession ? memberSeasonsPage : guestSeasonsPage));
++                });
++
++            var result = await Subject.Fetch(new TvSearchCriteria { SearchTerm = "shogun", Categories = new[] { 5000 } });
++
++            result.Releases.Should().HaveCount(3);
++            result.Releases.Should().OnlyContain(r => r.InfoUrl == "https://www.lostfilmtv5.site/series/Shogun/seasons");
++
++            // No login attempt at all: the stored captcha must not be resubmitted.
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php" && (v.GetContent() ?? string.Empty).Contains("type=login")),
++                    Subject.Definition),
++                Times.Never());
++
++            // The mirror is probed once without the session, then the request is replayed once with it.
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons" && !v.Cookies.ContainsKey("lf_session")),
++                    Subject.Definition),
++                Times.Once());
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons" && v.Cookies.ContainsKey("lf_session")),
++                    Subject.Definition),
++                Times.Once());
++        }
++
++        [Test]
++        public async Task should_keep_probed_mirror_when_session_replay_fails()
++        {
++            // If the replay with the session fails, the mirror that answered the probe must stay
++            // in use (the guest page then goes through the normal re-login path) instead of the
++            // request moving on to the next mirror with the session already switched.
++            const string geoBlockedPage = "error code: 1026";
++            var guestSeasonsPage = ReadAllText(@"Files/Indexers/LostFilm/shogun_seasons.html");
++
++            IDictionary<string, string> storedCookies = new Dictionary<string, string>
++            {
++                { "lf_session", "VALID_SESSION" },
++                { "PHPSESSID", "VALID_PHP" }
++            };
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) => storedCookies = cookies);
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => DateTime.Now.AddDays(30));
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.IsAny<HttpRequest>(), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), "<html><body></body></html>")));
++
++            MockResponse(HttpMethod.Post, "/ajaxik.php", ReadAllText(@"Files/Indexers/LostFilm/search_shogun.json"), "application/json");
++            MockResponse(HttpMethod.Get, "/v_search.php", ReadAllText(@"Files/Indexers/LostFilm/vsearch_shogun.html"));
++            MockResponse(HttpMethod.Get, "/V/", ReadAllText(@"Files/Indexers/LostFilm/tracker_shogun.html"));
++
++            client.Setup(o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilm.tv" && v.Url.Path == "/series/Shogun/seasons"),
++                    Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/plain" } }, new CookieCollection(), geoBlockedPage, statusCode: HttpStatusCode.UnavailableForLegalReasons)));
++            client.Setup(o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons"),
++                    Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    r.Cookies.ContainsKey("lf_session")
++                        ? throw new TaskCanceledException("replay timed out")
++                        : Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), guestSeasonsPage)));
++
++            await Subject.Fetch(new TvSearchCriteria { SearchTerm = "shogun", Categories = new[] { 5000 } });
++
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons" && v.Cookies.ContainsKey("lf_session")),
++                    Subject.Definition),
++                Times.AtLeastOnce());
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Url.Host == "www.lostfilmtv2.site"),
++                    Subject.Definition),
++                Times.Never());
++        }
++
+         [Test]
+         public void should_advertise_tv_and_movie_categories()
+         {
+diff --git a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
+index 49f9a53ba..8a76e8cb6 100644
+--- a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
++++ b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
+@@ -640,6 +640,22 @@ private async Task<HttpResponse> GetResponse(HttpRequest request, bool checkLogi
+                             _workingMirror = mirror;
+                         }
+ 
++                        // The probe went out without the session, so a page that needs a login
++                        // comes back as the guest version. The mirror is one of our own
++                        // IndexerUrls and is reachable: replay the request once with the session
++                        // (the LostFilm session cookie is accepted across mirrors) instead of
++                        // letting the guest page trigger a re-login, which would resubmit the
++                        // already-used captcha and fail with "Captcha is incorrect".
++                        if (CheckIfLoginNeeded(mirrorResponse) && HasSession(request))
++                        {
++                            var replayed = await TryReplayWithSession(request, mirror);
++
++                            if (replayed != null)
++                            {
++                                return replayed.Value;
++                            }
++                        }
++
+                         return (mirrorResponse, mirrorRequest);
+                     }
+                 }
+@@ -652,6 +668,28 @@ private async Task<HttpResponse> GetResponse(HttpRequest request, bool checkLogi
+             return null;
+         }
+ 
++        private async Task<(HttpResponse Response, HttpRequest Request)?> TryReplayWithSession(HttpRequest request, string mirror)
++        {
++            try
++            {
++                var sessionRequest = CloneForMirror(request, mirror);
++                var sessionResponse = await ExecuteAsync(sessionRequest);
++
++                if (!IsGeoBlocked(sessionResponse))
++                {
++                    return (sessionResponse, sessionRequest);
++                }
++            }
++            catch (Exception ex) when (IsMirrorFailoverException(ex))
++            {
++                // Keep the mirror that just answered the probe instead of moving on to the next
++                // one; the guest page then takes the normal re-login path.
++                _logger.Debug("LostFilm.tv: replaying the request with the session on {0} failed: {1}", mirror, ex.Message);
++            }
++
++            return null;
++        }
++
+         private IEnumerable<string> GetMirrorCandidates(string currentHost)
+         {
+             var candidates = new List<string>();
+@@ -676,6 +714,11 @@ private IEnumerable<string> GetMirrorCandidates(string currentHost)
+             return candidates;
+         }
+ 
++        private static bool HasSession(HttpRequest request)
++        {
++            return request.Cookies.TryGetValue("lf_session", out var session) && session.IsNotNullOrWhiteSpace();
++        }
++
+         private static HttpRequest CloneForMirror(HttpRequest request, string mirrorBaseUrl)
+         {
+             var mirrorUrl = new HttpUri(mirrorBaseUrl).CombinePath(request.Url.Path).SetQuery(request.Url.Query);
