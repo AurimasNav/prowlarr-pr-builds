@@ -21,6 +21,31 @@ commit named in its labels (`io.github.prowlarr.base-revision`, `org.opencontain
 `patches/<name>.patch` holds a fix proposed to the PR author; run the workflow with `patch: <name>`
 to build the PR with that patch applied on top (the image tag ends in `-<name>-r<run>`).
 
-- `pr2765-lostfilm-fixes`: LostFilm (#2765) reuses the session on the mirror after a geo-block
-  (no re-login with the used captcha) and parses dates without ru-RU culture data.
-- `pr2765-session-test-only`: only the new mirror-session test from `pr2765-lostfilm-fixes`, to show it fails without the fix.
+Patches whose names end in `-test-only` or `-tests-only`, and `pr2765-v2-tests-on-v1`, add tests without
+the fix they check. Their runs are meant to fail: the failing tests show that the tests catch the bug.
+A red run with one of these patches is not a broken build.
+
+LostFilm (#2765), one patch per fix proposed upstream:
+
+- `pr2765-pr-a-date-parsing`: parses dates without ru-RU culture data.
+- `pr2765-pr-b-mirror-session`: reuses the session on the mirror after a geo-block, instead of logging
+  in again with the used captcha.
+- `pr2765-pr-c-used-captcha`: doesn't resubmit a captcha that was already used, and retries once
+  without a rejected one.
+- `pr2765-pr-d-email-label`: labels the login field Email.
+- `pr2765-pr-e-history`: attaches the search and RSS responses, so History and the indexer stats
+  record the query as successful, with the time of the whole query.
+
+Combinations: `pr2765-pr-a-plus-b`, `pr2765-pr-a-b-c`, `pr2765-pr-a-b-c-d`, `pr2765-pr-a-b-c-e` (all but
+the Email label, so a test instance keeps its saved login) and `pr2765-pr-a-e` (all five).
+
+Tests only, meant to fail:
+
+- `pr2765-pr-c-tests-only`: the tests from `pr2765-pr-c-used-captcha`.
+- `pr2765-pr-e-tests-only`: the tests from `pr2765-pr-e-history`.
+- `pr2765-session-test-only`: the mirror-session test from `pr2765-lostfilm-fixes`.
+- `pr2765-v2-session-test-only`: the mirror-session tests from `pr2765-lostfilm-fixes-v2`.
+- `pr2765-v2-tests-on-v1`: the v2 tests on top of the v1 fix; two of them fail, which shows what v2 adds.
+
+Earlier rounds, replaced by the patches above: `pr2765-lostfilm-fixes` (mirror session and dates) and
+`pr2765-lostfilm-fixes-v2`.
