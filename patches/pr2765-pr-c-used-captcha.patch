@@ -1,8 +1,8 @@
 diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
-index 66709d47f..fb0c77c38 100644
+index 66709d47f..e39360b07 100644
 --- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
 +++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
-@@ -849,6 +849,158 @@ public void should_report_captcha_incorrect_and_clear_captcha_for_error_4()
+@@ -849,6 +849,213 @@ public void should_report_captcha_incorrect_and_clear_captcha_for_error_4()
              ((LostFilmSettings)Subject.Definition.Settings).Captcha.Should().BeNull();
          }
  
@@ -125,6 +125,61 @@ index 66709d47f..fb0c77c38 100644
 +        }
 +
 +        [Test]
++        public void should_retry_without_a_rejected_captcha_that_was_never_remembered()
++        {
++            // Adding the indexer logs in with the captcha before the indexer has an id, so the
++            // used captcha cannot be remembered, while the form saves it. After a restart the
++            // re-login submits it again and LostFilm rejects it; the password alone still works.
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "12345";
++
++            IDictionary<string, string> storedCookies = null;
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) => storedCookies = cookies);
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => DateTime.Now.AddDays(30));
++
++            const string anonPage = "<html><body><a href=\"/login\" class=\"link\">Вход</a></body></html>";
++            const string authedPage = "<html><body><div class=\"row\"></div></body></html>";
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++            var newRequestCount = 0;
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Path == "/new"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), ++newRequestCount == 1 ? anonPage : authedPage)));
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var body = r.GetContent() ?? string.Empty;
++
++                    if (body.Contains("type=logout"))
++                    {
++                        return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), "{\"result\":\"ok\"}"));
++                    }
++
++                    if (body.Contains("captcha="))
++                    {
++                        return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), "{\"error\":4,\"result\":\"ok\"}"));
++                    }
++
++                    var loginCookies = new CookieCollection { new Cookie("lf_session", "NEWSESSION", "/") { Expires = DateTime.Now.AddYears(1) } };
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, loginCookies, "{\"success\":true,\"result\":\"ok\"}"));
++                });
++
++            var result = Subject.Test();
++
++            result.IsValid.Should().BeTrue();
++            client.Verify(
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && (v.GetContent() ?? string.Empty).Contains("captcha=12345")), Subject.Definition),
++                Times.Once());
++            storedCookies.Should().Contain("lf_session", "NEWSESSION");
++            storedCookies.Should().Contain("__lf_captcha_used", "12345");
++        }
++
++        [Test]
 +        public void should_submit_a_new_captcha_after_a_used_one()
 +        {
 +            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "67890";
@@ -162,10 +217,10 @@ index 66709d47f..fb0c77c38 100644
          public async Task should_skip_extras_block_during_season_scoped_search()
          {
 diff --git a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
-index 49f9a53ba..061b090ee 100644
+index 49f9a53ba..65290e255 100644
 --- a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
 +++ b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
-@@ -41,6 +41,13 @@ public class LostFilm : TorrentIndexerBase<LostFilmSettings>
+@@ -41,6 +41,15 @@ public class LostFilm : TorrentIndexerBase<LostFilmSettings>
          // Never forwarded as a real HTTP cookie - stripped out in BuildRequest.
          private const string CaptchaHostCookieKey = "__lf_captcha_host";
  
@@ -176,10 +231,12 @@ index 49f9a53ba..061b090ee 100644
 +        // submit it twice. Never forwarded as a real HTTP cookie either.
 +        private const string UsedCaptchaCookieKey = "__lf_captcha_used";
 +
++        private const string CaptchaRequiredMessage = "LostFilm.tv requires a captcha. Open the indexer settings to fetch a new one.";
++
          // A hung/blackholed mirror candidate otherwise costs the full default dispatcher timeout
          // per mirror tried; cap both the per-probe wait and how many candidates get tried.
          private const int MaxMirrorCandidates = 3;
-@@ -157,7 +164,8 @@ protected override async Task DoLogin()
+@@ -157,7 +166,8 @@ protected override async Task DoLogin()
          {
              _logger.Debug("Logging in to LostFilm.tv");
  
@@ -189,7 +246,7 @@ index 49f9a53ba..061b090ee 100644
              var loginBaseUrl = ResolveLoginBaseUrl(captchaSubmitted);
  
              if (!captchaSubmitted)
-@@ -182,7 +190,7 @@ protected override async Task DoLogin()
+@@ -182,7 +192,7 @@ protected override async Task DoLogin()
              if (captchaSubmitted)
              {
                  requestBuilder.AddFormParameter("need_captcha", "1");
@@ -198,15 +255,18 @@ index 49f9a53ba..061b090ee 100644
              }
  
              var request = BuildRequest(requestBuilder);
-@@ -196,6 +204,7 @@ protected override async Task DoLogin()
+@@ -196,8 +206,9 @@ protected override async Task DoLogin()
                  // A captcha is required but the one we hold is stale or missing entirely.
                  // Clear it so it is not reused and ask the user to fetch a fresh one.
                  Settings.Captcha = null;
 +                RememberUsedCaptcha(captcha);
  
-                 throw new IndexerAuthException("LostFilm.tv requires a captcha. Open the indexer settings to fetch a new one.");
+-                throw new IndexerAuthException("LostFilm.tv requires a captcha. Open the indexer settings to fetch a new one.");
++                throw new IndexerAuthException(CaptchaRequiredMessage);
              }
-@@ -225,6 +234,7 @@ protected override async Task DoLogin()
+ 
+             // LostFilm returns {"error":N,"result":"ok"} on failure. Parse the code instead of
+@@ -225,15 +236,31 @@ protected override async Task DoLogin()
                  // LostFilm captchas are single-use and bound to the login session, so a
                  // failed captcha can never succeed again. Clear it to stop the retry loop.
                  Settings.Captcha = null;
@@ -214,7 +274,33 @@ index 49f9a53ba..061b090ee 100644
  
                  // No captcha was even submitted, so "error":4 here cannot mean "you typed the
                  // wrong answer" - it means one is required, same as the need_captcha case above.
-@@ -259,6 +269,14 @@ protected override async Task DoLogin()
+                 if (!captchaSubmitted)
+                 {
+-                    throw new IndexerAuthException("LostFilm.tv requires a captcha. Open the indexer settings to fetch a new one.");
++                    throw new IndexerAuthException(CaptchaRequiredMessage);
+                 }
+ 
+-                throw new IndexerAuthException("Captcha is incorrect");
++                // A rejected captcha is either a wrong answer or one that an earlier login already
++                // used without it being remembered: the login that tests a new indexer runs before
++                // the indexer has an id, so nothing can be stored for it, while the form saves the
++                // captcha. The password alone may still be accepted, so try that once.
++                _logger.Debug("LostFilm.tv: captcha rejected, retrying the login without it");
++
++                try
++                {
++                    await DoLogin();
++                }
++                catch (IndexerAuthException ex) when (ex.Message == CaptchaRequiredMessage)
++                {
++                    throw new IndexerAuthException("Captcha is incorrect or was already used. Open the indexer settings to fetch a new one.");
++                }
++
++                return;
+             }
+ 
+             if (errorCode == 3)
+@@ -259,6 +286,14 @@ protected override async Task DoLogin()
  
              var cookies = response.GetCookies();
  
@@ -229,7 +315,7 @@ index 49f9a53ba..061b090ee 100644
              // lf_session is a durable cookie (expires years out); keep it in the DB for as long
              // as the server says it is valid instead of forcing a re-login every 30 days.
              DateTime? expiration = null;
-@@ -302,6 +320,50 @@ private string ResolveLoginBaseUrl(bool captchaSubmitted)
+@@ -302,6 +337,50 @@ private string ResolveLoginBaseUrl(bool captchaSubmitted)
              return loginBaseUrl ?? BaseUrl;
          }
  
@@ -280,7 +366,7 @@ index 49f9a53ba..061b090ee 100644
          private string GetPinnedCaptchaHost()
          {
              Cookies ??= LoadCookies();
-@@ -430,7 +492,7 @@ private HttpRequest BuildRequest(HttpRequestBuilder builder)
+@@ -430,7 +509,7 @@ private HttpRequest BuildRequest(HttpRequestBuilder builder)
                  foreach (var cookie in Cookies)
                  {
                      // Internal bookkeeping, never a real cookie for the server.
@@ -289,7 +375,7 @@ index 49f9a53ba..061b090ee 100644
                      {
                          continue;
                      }
-@@ -520,7 +582,7 @@ private async Task<HttpResponse> GetResponse(HttpRequest request, bool checkLogi
+@@ -520,7 +599,7 @@ private async Task<HttpResponse> GetResponse(HttpRequest request, bool checkLogi
  
                  if (Cookies != null)
                  {
