@@ -1,0 +1,621 @@
+diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+index 66709d47f..6ce733e44 100644
+--- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
++++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+@@ -492,6 +492,149 @@ public async Task should_fallback_to_mirror_when_primary_is_geo_blocked()
+                 Times.Exactly(2));
+         }
+ 
++        [Test]
++        public async Task should_reuse_session_on_mirror_instead_of_relogin_when_primary_is_geo_blocked()
++        {
++            // Regression: the mirror probe is sent without the session cookies, so a geo-blocked
++            // page that needs a login came back as the guest version, which triggered a re-login
++            // with the captcha stored in the settings. LostFilm captchas are single-use, so that
++            // login failed ("Captcha is incorrect") and the indexer got disabled even though the
++            // session was still valid. The proven mirror must get the request replayed with the
++            // session instead, without any login.
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "used-captcha";
++
++            const string geoBlockedPage = "error code: 1026";
++            var guestSeasonsPage = ReadAllText(@"Files/Indexers/LostFilm/shogun_seasons.html");
++            var memberSeasonsPage = guestSeasonsPage.Replace("href=\"/login\"", "href=\"/my\"");
++
++            IDictionary<string, string> storedCookies = new Dictionary<string, string>
++            {
++                { "lf_session", "VALID_SESSION" },
++                { "PHPSESSID", "VALID_PHP" }
++            };
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) => storedCookies = cookies);
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => DateTime.Now.AddDays(30));
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.IsAny<HttpRequest>(), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), "<html><body></body></html>")));
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var body = r.GetContent() ?? string.Empty;
++                    var content = body.Contains("type=login") ? "{\"error\":4,\"result\":\"ok\"}" : ReadAllText(@"Files/Indexers/LostFilm/search_shogun.json");
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), content));
++                });
++
++            MockResponse(HttpMethod.Get, "/v_search.php", ReadAllText(@"Files/Indexers/LostFilm/vsearch_shogun.html"));
++            MockResponse(HttpMethod.Get, "/V/", ReadAllText(@"Files/Indexers/LostFilm/tracker_shogun.html"));
++
++            client.Setup(o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilm.tv" && v.Url.Path == "/series/Shogun/seasons"),
++                    Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/plain" } }, new CookieCollection(), geoBlockedPage, statusCode: HttpStatusCode.UnavailableForLegalReasons)));
++            client.Setup(o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons"),
++                    Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var hasSession = r.Cookies.TryGetValue("lf_session", out var session) && session == "VALID_SESSION";
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), hasSession ? memberSeasonsPage : guestSeasonsPage));
++                });
++
++            var result = await Subject.Fetch(new TvSearchCriteria { SearchTerm = "shogun", Categories = new[] { 5000 } });
++
++            result.Releases.Should().HaveCount(3);
++            result.Releases.Should().OnlyContain(r => r.InfoUrl == "https://www.lostfilmtv5.site/series/Shogun/seasons");
++
++            // No login attempt at all: the stored captcha must not be resubmitted.
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php" && (v.GetContent() ?? string.Empty).Contains("type=login")),
++                    Subject.Definition),
++                Times.Never());
++
++            // The mirror is probed once without the session, then the request is replayed once with it.
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons" && !v.Cookies.ContainsKey("lf_session")),
++                    Subject.Definition),
++                Times.Once());
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons" && v.Cookies.ContainsKey("lf_session")),
++                    Subject.Definition),
++                Times.Once());
++        }
++
++        [Test]
++        public async Task should_keep_probed_mirror_when_session_replay_fails()
++        {
++            // If the replay with the session fails, the mirror that answered the probe must stay
++            // in use (the guest page then goes through the normal re-login path) instead of the
++            // request moving on to the next mirror with the session already switched.
++            const string geoBlockedPage = "error code: 1026";
++            var guestSeasonsPage = ReadAllText(@"Files/Indexers/LostFilm/shogun_seasons.html");
++
++            IDictionary<string, string> storedCookies = new Dictionary<string, string>
++            {
++                { "lf_session", "VALID_SESSION" },
++                { "PHPSESSID", "VALID_PHP" }
++            };
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) => storedCookies = cookies);
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => DateTime.Now.AddDays(30));
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.IsAny<HttpRequest>(), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), "<html><body></body></html>")));
++
++            MockResponse(HttpMethod.Post, "/ajaxik.php", ReadAllText(@"Files/Indexers/LostFilm/search_shogun.json"), "application/json");
++            MockResponse(HttpMethod.Get, "/v_search.php", ReadAllText(@"Files/Indexers/LostFilm/vsearch_shogun.html"));
++            MockResponse(HttpMethod.Get, "/V/", ReadAllText(@"Files/Indexers/LostFilm/tracker_shogun.html"));
++
++            client.Setup(o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilm.tv" && v.Url.Path == "/series/Shogun/seasons"),
++                    Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/plain" } }, new CookieCollection(), geoBlockedPage, statusCode: HttpStatusCode.UnavailableForLegalReasons)));
++            client.Setup(o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons"),
++                    Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    r.Cookies.ContainsKey("lf_session")
++                        ? throw new TaskCanceledException("replay timed out")
++                        : Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), guestSeasonsPage)));
++
++            await Subject.Fetch(new TvSearchCriteria { SearchTerm = "shogun", Categories = new[] { 5000 } });
++
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Url.Host == "www.lostfilmtv5.site" && v.Url.Path == "/series/Shogun/seasons" && v.Cookies.ContainsKey("lf_session")),
++                    Subject.Definition),
++                Times.AtLeastOnce());
++            client.Verify(
++                o => o.ExecuteProxiedAsync(
++                    It.Is<HttpRequest>(v => v.Url.Host == "www.lostfilmtv2.site"),
++                    Subject.Definition),
++                Times.Never());
++        }
++
+         [Test]
+         public void should_advertise_tv_and_movie_categories()
+         {
+@@ -849,6 +992,158 @@ public void should_report_captcha_incorrect_and_clear_captcha_for_error_4()
+             ((LostFilmSettings)Subject.Definition.Settings).Captcha.Should().BeNull();
+         }
+ 
++        [Test]
++        public void should_not_resubmit_a_captcha_that_was_already_used()
++        {
++            // Regression: clearing Settings.Captcha after a login only changed this instance, so the
++            // used captcha stayed in the database (and in the settings form, which sends it back on
++            // Save). The next re-login resubmitted it and failed with "Captcha is incorrect" even
++            // though LostFilm would have accepted the password alone.
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "12345";
++
++            IDictionary<string, string> storedCookies = new Dictionary<string, string>
++            {
++                { "lf_session", "EXPIRED_SESSION" },
++                { "__lf_captcha_used", "12345" }
++            };
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) => storedCookies = cookies);
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => DateTime.Now.AddDays(30));
++
++            const string anonPage = "<html><body><a href=\"/login\" class=\"link\">Вход</a></body></html>";
++            const string authedPage = "<html><body><div class=\"row\"></div></body></html>";
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++            var newRequestCount = 0;
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Path == "/new"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), ++newRequestCount == 1 ? anonPage : authedPage)));
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var body = r.GetContent() ?? string.Empty;
++
++                    if (body.Contains("type=logout"))
++                    {
++                        return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), "{\"result\":\"ok\"}"));
++                    }
++
++                    if (body.Contains("captcha="))
++                    {
++                        return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), "{\"error\":4,\"result\":\"ok\"}"));
++                    }
++
++                    var loginCookies = new CookieCollection { new Cookie("lf_session", "NEWSESSION", "/") { Expires = DateTime.Now.AddYears(1) } };
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, loginCookies, "{\"success\":true,\"result\":\"ok\"}"));
++                });
++
++            var result = Subject.Test();
++
++            result.IsValid.Should().BeTrue();
++            client.Verify(
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => (v.GetContent() ?? string.Empty).Contains("captcha=")), Subject.Definition),
++                Times.Never());
++
++            // Still remembered after the new login, so the stored captcha is never tried later either.
++            storedCookies.Should().Contain("lf_session", "NEWSESSION");
++            storedCookies.Should().Contain("__lf_captcha_used", "12345");
++
++            // The bookkeeping entries must never reach LostFilm as cookies.
++            client.Verify(
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Cookies.Keys.Any(k => k.StartsWith("__lf_"))), Subject.Definition),
++                Times.Never());
++        }
++
++        [Test]
++        public void should_not_retry_a_rejected_captcha_after_it_is_loaded_again()
++        {
++            // A rejected captcha is cleared on this instance only; the next instance loads it from
++            // the database again. It must not be submitted a second time: with no usable captcha
++            // left, the user has to fetch a new one, so say that instead of "Captcha is incorrect".
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "12345";
++
++            IDictionary<string, string> storedCookies = null;
++            DateTime? storedExpiration = null;
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) =>
++                {
++                    storedCookies = cookies;
++                    storedExpiration = expiration;
++                });
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => storedExpiration ?? DateTime.Now.AddDays(30));
++
++            const string anonPage = "<html><body><a href=\"/login\" class=\"link\">Вход</a></body></html>";
++            MockResponse(HttpMethod.Get, "/new", anonPage);
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var body = r.GetContent() ?? string.Empty;
++                    var content = body.Contains("type=logout") ? "{\"result\":\"ok\"}" : "{\"error\":4,\"result\":\"ok\"}";
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), content));
++                });
++
++            var first = Subject.Test();
++
++            first.Errors.Should().ContainSingle(e => e.ErrorMessage.Contains("Captcha is incorrect"));
++            storedCookies.Should().Contain("__lf_captcha_used", "12345");
++
++            // A new instance gets the settings, including the rejected captcha, from the database.
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "12345";
++            Subject.Cookies = null;
++
++            var second = Subject.Test();
++
++            second.Errors.Should().ContainSingle(e => e.ErrorMessage.Contains("requires a captcha"));
++            client.Verify(
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => (v.GetContent() ?? string.Empty).Contains("captcha=12345")), Subject.Definition),
++                Times.Once());
++        }
++
++        [Test]
++        public void should_submit_a_new_captcha_after_a_used_one()
++        {
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "67890";
++
++            IDictionary<string, string> storedCookies = new Dictionary<string, string> { { "__lf_captcha_used", "12345" } };
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) => storedCookies = cookies);
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => DateTime.Now.AddDays(30));
++
++            const string anonPage = "<html><body><a href=\"/login\" class=\"link\">Вход</a></body></html>";
++            const string authedPage = "<html><body><div class=\"row\"></div></body></html>";
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++            var newRequestCount = 0;
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Path == "/new"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), ++newRequestCount == 1 ? anonPage : authedPage)));
++
++            var loginCookies = new CookieCollection { new Cookie("lf_session", "NEWSESSION", "/") { Expires = DateTime.Now.AddYears(1) } };
++            MockResponse(HttpMethod.Post, "/ajaxik.php", "{\"success\":true,\"result\":\"ok\"}", loginCookies, "application/json");
++
++            var result = Subject.Test();
++
++            result.IsValid.Should().BeTrue();
++            client.Verify(
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => (v.GetContent() ?? string.Empty).Contains("captcha=67890")), Subject.Definition),
++                Times.Once());
++            storedCookies.Should().Contain("__lf_captcha_used", "67890");
++        }
++
+         [Test]
+         public async Task should_skip_extras_block_during_season_scoped_search()
+         {
+@@ -914,5 +1209,32 @@ public async Task should_not_throw_when_episode_date_text_has_marker_out_of_orde
+             result.Releases.Should().NotBeEmpty();
+             result.Releases.Should().OnlyContain(r => r.PublishDate > DateTime.Now.AddMinutes(-1));
+         }
++
++        [TestCase("08.04.2022", 2022, 4, 8)]
++        [TestCase("29.09.2013", 2013, 9, 29)]
++        [TestCase("1.5.2020", 2020, 5, 1)]
++        [TestCase("17 декабря 2009", 2009, 12, 17)]
++        [TestCase("01 октября 2013", 2013, 10, 1)]
++        [TestCase(" 30 января 2025 ", 2025, 1, 30)]
++        [TestCase("29 Февраля 2024", 2024, 2, 29)]
++        public void should_parse_lostfilm_dates_without_russian_culture_data(string text, int year, int month, int day)
++        {
++            // Regression: dates were parsed with the ru-RU culture, which falls back to English
++            // formats when only English ICU data is installed (e.g. the linuxserver.io Alpine
++            // image), so "08.04.2022" became August 4th and month names fell back to now.
++            LostFilm.ParseRussianDate(text).Should().Be(new DateTime(year, month, day));
++        }
++
++        [TestCase(null)]
++        [TestCase("")]
++        [TestCase("TBA")]
++        [TestCase("31 февраля 2020")]
++        [TestCase("13.13.2020")]
++        [TestCase("17 december 2009")]
++        [TestCase("١٧ декабря 2009")]
++        public void should_not_parse_invalid_lostfilm_dates(string text)
++        {
++            LostFilm.ParseRussianDate(text).Should().BeNull();
++        }
+     }
+ }
+diff --git a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
+index 49f9a53ba..de7bada6a 100644
+--- a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
++++ b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
+@@ -41,6 +41,13 @@ public class LostFilm : TorrentIndexerBase<LostFilmSettings>
+         // Never forwarded as a real HTTP cookie - stripped out in BuildRequest.
+         private const string CaptchaHostCookieKey = "__lf_captcha_host";
+ 
++        // LostFilm accepts each captcha once, but clearing Settings.Captcha after a login only
++        // changes this instance: the database keeps the used value (and the open settings form
++        // sends it back on Save), so a later re-login would resubmit it and fail with "Captcha is
++        // incorrect". Remember the last submitted captcha in the same durable store and never
++        // submit it twice. Never forwarded as a real HTTP cookie either.
++        private const string UsedCaptchaCookieKey = "__lf_captcha_used";
++
+         // A hung/blackholed mirror candidate otherwise costs the full default dispatcher timeout
+         // per mirror tried; cap both the per-probe wait and how many candidates get tried.
+         private const int MaxMirrorCandidates = 3;
+@@ -62,7 +69,18 @@ public class LostFilm : TorrentIndexerBase<LostFilmSettings>
+             (new Regex("1080 ", RegexOptions.Compiled | RegexOptions.IgnoreCase), "1080p "),
+             (new Regex("720 ", RegexOptions.Compiled | RegexOptions.IgnoreCase), "720p ")
+         };
+-        private static readonly CultureInfo RuCulture = CultureInfo.GetCultureInfo("ru-RU");
++
++        // LostFilm dates are "dd.MM.yyyy" or "d MMMM yyyy" with a Russian month name in the
++        // genitive ("17 декабря 2009"). They are parsed without relying on the ru-RU culture:
++        // with only English ICU data installed (Alpine's icu-data-en, as in the linuxserver.io
++        // image) ru-RU falls back to English formats, so "08.04.2022" was read as August 4th
++        // and month names did not parse at all.
++        private static readonly string[] RussianMonthsGenitive =
++        {
++            "января", "февраля", "марта", "апреля", "мая", "июня",
++            "июля", "августа", "сентября", "октября", "ноября", "декабря"
++        };
++        private static readonly Regex RussianLongDateRegex = new(@"^(?<day>[0-9]{1,2})\s+(?<month>\p{L}+)\s+(?<year>[0-9]{4})$", RegexOptions.Compiled);
+         private static readonly HashSet<string> SearchStopWords = new(StringComparer.OrdinalIgnoreCase)
+         {
+             "the", "a", "an", "of", "to", "and", "for", "in", "on", "with", "at", "by", "from", "is", "it", "or", "as", "be",
+@@ -157,7 +175,8 @@ protected override async Task DoLogin()
+         {
+             _logger.Debug("Logging in to LostFilm.tv");
+ 
+-            var captchaSubmitted = Settings.Captcha.IsNotNullOrWhiteSpace();
++            var captcha = GetUnusedCaptcha();
++            var captchaSubmitted = captcha.IsNotNullOrWhiteSpace();
+             var loginBaseUrl = ResolveLoginBaseUrl(captchaSubmitted);
+ 
+             if (!captchaSubmitted)
+@@ -182,7 +201,7 @@ protected override async Task DoLogin()
+             if (captchaSubmitted)
+             {
+                 requestBuilder.AddFormParameter("need_captcha", "1");
+-                requestBuilder.AddFormParameter("captcha", Settings.Captcha);
++                requestBuilder.AddFormParameter("captcha", captcha);
+             }
+ 
+             var request = BuildRequest(requestBuilder);
+@@ -196,6 +215,7 @@ protected override async Task DoLogin()
+                 // A captcha is required but the one we hold is stale or missing entirely.
+                 // Clear it so it is not reused and ask the user to fetch a fresh one.
+                 Settings.Captcha = null;
++                RememberUsedCaptcha(captcha);
+ 
+                 throw new IndexerAuthException("LostFilm.tv requires a captcha. Open the indexer settings to fetch a new one.");
+             }
+@@ -225,6 +245,7 @@ protected override async Task DoLogin()
+                 // LostFilm captchas are single-use and bound to the login session, so a
+                 // failed captcha can never succeed again. Clear it to stop the retry loop.
+                 Settings.Captcha = null;
++                RememberUsedCaptcha(captcha);
+ 
+                 // No captcha was even submitted, so "error":4 here cannot mean "you typed the
+                 // wrong answer" - it means one is required, same as the need_captcha case above.
+@@ -259,6 +280,14 @@ protected override async Task DoLogin()
+ 
+             var cookies = response.GetCookies();
+ 
++            // The login replaces the stored cookies; keep the used-captcha marker with them.
++            var usedCaptcha = captchaSubmitted ? captcha : GetUsedCaptcha();
++
++            if (usedCaptcha.IsNotNullOrWhiteSpace())
++            {
++                cookies[UsedCaptchaCookieKey] = usedCaptcha;
++            }
++
+             // lf_session is a durable cookie (expires years out); keep it in the DB for as long
+             // as the server says it is valid instead of forcing a re-login every 30 days.
+             DateTime? expiration = null;
+@@ -302,6 +331,50 @@ private string ResolveLoginBaseUrl(bool captchaSubmitted)
+             return loginBaseUrl ?? BaseUrl;
+         }
+ 
++        // The captcha from the settings, unless it is the one that was already submitted.
++        private string GetUnusedCaptcha()
++        {
++            var captcha = Settings.Captcha?.Trim();
++
++            if (captcha.IsNullOrWhiteSpace())
++            {
++                return null;
++            }
++
++            if (captcha == GetUsedCaptcha())
++            {
++                _logger.Debug("LostFilm.tv: the captcha in the settings was already used, logging in without it");
++
++                return null;
++            }
++
++            return captcha;
++        }
++
++        private string GetUsedCaptcha()
++        {
++            Cookies ??= LoadCookies();
++
++            return Cookies != null && Cookies.TryGetValue(UsedCaptchaCookieKey, out var usedCaptcha) ? usedCaptcha : null;
++        }
++
++        private void RememberUsedCaptcha(string captcha)
++        {
++            if (captcha.IsNullOrWhiteSpace())
++            {
++                return;
++            }
++
++            Cookies ??= LoadCookies() ?? new Dictionary<string, string>();
++            Cookies[UsedCaptchaCookieKey] = captcha;
++            PersistCookies(Cookies, _cookiesExpiration ?? DateTime.Now.AddDays(30));
++        }
++
++        private static bool IsInternalCookie(string key)
++        {
++            return key == CaptchaHostCookieKey || key == UsedCaptchaCookieKey;
++        }
++
+         private string GetPinnedCaptchaHost()
+         {
+             Cookies ??= LoadCookies();
+@@ -430,7 +503,7 @@ private HttpRequest BuildRequest(HttpRequestBuilder builder)
+                 foreach (var cookie in Cookies)
+                 {
+                     // Internal bookkeeping, never a real cookie for the server.
+-                    if (cookie.Key == CaptchaHostCookieKey)
++                    if (IsInternalCookie(cookie.Key))
+                     {
+                         continue;
+                     }
+@@ -520,7 +593,7 @@ private async Task<HttpResponse> GetResponse(HttpRequest request, bool checkLogi
+ 
+                 if (Cookies != null)
+                 {
+-                    foreach (var cookie in Cookies)
++                    foreach (var cookie in Cookies.Where(c => !IsInternalCookie(c.Key)))
+                     {
+                         requestUsed.Cookies[cookie.Key] = cookie.Value;
+                     }
+@@ -640,6 +713,22 @@ private async Task<HttpResponse> GetResponse(HttpRequest request, bool checkLogi
+                             _workingMirror = mirror;
+                         }
+ 
++                        // The probe went out without the session, so a page that needs a login
++                        // comes back as the guest version. The mirror is one of our own
++                        // IndexerUrls and is reachable: replay the request once with the session
++                        // (the LostFilm session cookie is accepted across mirrors) instead of
++                        // letting the guest page trigger a re-login, which would resubmit the
++                        // already-used captcha and fail with "Captcha is incorrect".
++                        if (CheckIfLoginNeeded(mirrorResponse) && HasSession(request))
++                        {
++                            var replayed = await TryReplayWithSession(request, mirror);
++
++                            if (replayed != null)
++                            {
++                                return replayed.Value;
++                            }
++                        }
++
+                         return (mirrorResponse, mirrorRequest);
+                     }
+                 }
+@@ -652,6 +741,28 @@ private async Task<HttpResponse> GetResponse(HttpRequest request, bool checkLogi
+             return null;
+         }
+ 
++        private async Task<(HttpResponse Response, HttpRequest Request)?> TryReplayWithSession(HttpRequest request, string mirror)
++        {
++            try
++            {
++                var sessionRequest = CloneForMirror(request, mirror);
++                var sessionResponse = await ExecuteAsync(sessionRequest);
++
++                if (!IsGeoBlocked(sessionResponse))
++                {
++                    return (sessionResponse, sessionRequest);
++                }
++            }
++            catch (Exception ex) when (IsMirrorFailoverException(ex))
++            {
++                // Keep the mirror that just answered the probe instead of moving on to the next
++                // one; the guest page then takes the normal re-login path.
++                _logger.Debug("LostFilm.tv: replaying the request with the session on {0} failed: {1}", mirror, ex.Message);
++            }
++
++            return null;
++        }
++
+         private IEnumerable<string> GetMirrorCandidates(string currentHost)
+         {
+             var candidates = new List<string>();
+@@ -676,6 +787,11 @@ private IEnumerable<string> GetMirrorCandidates(string currentHost)
+             return candidates;
+         }
+ 
++        private static bool HasSession(HttpRequest request)
++        {
++            return request.Cookies.TryGetValue("lf_session", out var session) && session.IsNotNullOrWhiteSpace();
++        }
++
+         private static HttpRequest CloneForMirror(HttpRequest request, string mirrorBaseUrl)
+         {
+             var mirrorUrl = new HttpUri(mirrorBaseUrl).CombinePath(request.Url.Path).SetQuery(request.Url.Query);
+@@ -1100,9 +1216,9 @@ private async Task<List<ReleaseInfo>> FetchEpisodeReleases(string url)
+                         date = parsedDate;
+                     }
+                 }
+-                else if (DateTime.TryParse(dateString, RuCulture, DateTimeStyles.AssumeLocal, out var parsedDate))
++                else
+                 {
+-                    date = parsedDate;
++                    date = ParseRussianDate(dateString);
+                 }
+             }
+ 
+@@ -1519,7 +1635,40 @@ private static DateTime DateFromEpisodeColumn(IElement dateColumn)
+             }
+ 
+             // dd.mm.yyyy
+-            return DateTime.TryParse(dateString, RuCulture, DateTimeStyles.AssumeLocal, out var parsedDate) ? parsedDate : DateTime.Now;
++            return ParseRussianDate(dateString) ?? DateTime.Now;
++        }
++
++        internal static DateTime? ParseRussianDate(string dateString)
++        {
++            if (dateString.IsNullOrWhiteSpace())
++            {
++                return null;
++            }
++
++            dateString = dateString.Trim();
++
++            if (DateTime.TryParseExact(dateString, new[] { "dd.MM.yyyy", "d.M.yyyy" }, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var numericDate))
++            {
++                return numericDate;
++            }
++
++            var match = RussianLongDateRegex.Match(dateString);
++
++            if (!match.Success)
++            {
++                return null;
++            }
++
++            var day = int.Parse(match.Groups["day"].Value, CultureInfo.InvariantCulture);
++            var month = Array.FindIndex(RussianMonthsGenitive, m => m.Equals(match.Groups["month"].Value, StringComparison.OrdinalIgnoreCase)) + 1;
++            var year = int.Parse(match.Groups["year"].Value, CultureInfo.InvariantCulture);
++
++            if (month == 0 || year < 1 || day < 1 || day > DateTime.DaysInMonth(year, month))
++            {
++                return null;
++            }
++
++            return new DateTime(year, month, day, 0, 0, 0, DateTimeKind.Local);
+         }
+ 
+         private IndexerCapabilities SetCapabilities()

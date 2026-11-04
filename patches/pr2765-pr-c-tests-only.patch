@@ -1,0 +1,163 @@
+diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+index 66709d47f..ab33d4016 100644
+--- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
++++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+@@ -849,6 +849,158 @@ public void should_report_captcha_incorrect_and_clear_captcha_for_error_4()
+             ((LostFilmSettings)Subject.Definition.Settings).Captcha.Should().BeNull();
+         }
+ 
++        [Test]
++        public void should_not_resubmit_a_captcha_that_was_already_used()
++        {
++            // Regression: clearing Settings.Captcha after a login only changed this instance, so the
++            // used captcha stayed in the database (and in the settings form, which sends it back on
++            // Save). The next re-login resubmitted it and failed with "Captcha is incorrect" even
++            // though LostFilm would have accepted the password alone.
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "12345";
++
++            IDictionary<string, string> storedCookies = new Dictionary<string, string>
++            {
++                { "lf_session", "EXPIRED_SESSION" },
++                { "__lf_captcha_used", "12345" }
++            };
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) => storedCookies = cookies);
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => DateTime.Now.AddDays(30));
++
++            const string anonPage = "<html><body><a href=\"/login\" class=\"link\">Вход</a></body></html>";
++            const string authedPage = "<html><body><div class=\"row\"></div></body></html>";
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++            var newRequestCount = 0;
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Path == "/new"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), ++newRequestCount == 1 ? anonPage : authedPage)));
++
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var body = r.GetContent() ?? string.Empty;
++
++                    if (body.Contains("type=logout"))
++                    {
++                        return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), "{\"result\":\"ok\"}"));
++                    }
++
++                    if (body.Contains("captcha="))
++                    {
++                        return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), "{\"error\":4,\"result\":\"ok\"}"));
++                    }
++
++                    var loginCookies = new CookieCollection { new Cookie("lf_session", "NEWSESSION", "/") { Expires = DateTime.Now.AddYears(1) } };
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, loginCookies, "{\"success\":true,\"result\":\"ok\"}"));
++                });
++
++            var result = Subject.Test();
++
++            result.IsValid.Should().BeTrue();
++            client.Verify(
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => (v.GetContent() ?? string.Empty).Contains("captcha=")), Subject.Definition),
++                Times.Never());
++
++            // Still remembered after the new login, so the stored captcha is never tried later either.
++            storedCookies.Should().Contain("lf_session", "NEWSESSION");
++            storedCookies.Should().Contain("__lf_captcha_used", "12345");
++
++            // The bookkeeping entries must never reach LostFilm as cookies.
++            client.Verify(
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Cookies.Keys.Any(k => k.StartsWith("__lf_"))), Subject.Definition),
++                Times.Never());
++        }
++
++        [Test]
++        public void should_not_retry_a_rejected_captcha_after_it_is_loaded_again()
++        {
++            // A rejected captcha is cleared on this instance only; the next instance loads it from
++            // the database again. It must not be submitted a second time: with no usable captcha
++            // left, the user has to fetch a new one, so say that instead of "Captcha is incorrect".
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "12345";
++
++            IDictionary<string, string> storedCookies = null;
++            DateTime? storedExpiration = null;
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) =>
++                {
++                    storedCookies = cookies;
++                    storedExpiration = expiration;
++                });
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => storedExpiration ?? DateTime.Now.AddDays(30));
++
++            const string anonPage = "<html><body><a href=\"/login\" class=\"link\">Вход</a></body></html>";
++            MockResponse(HttpMethod.Get, "/new", anonPage);
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && v.Url.Path == "/ajaxik.php"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                {
++                    var body = r.GetContent() ?? string.Empty;
++                    var content = body.Contains("type=logout") ? "{\"result\":\"ok\"}" : "{\"error\":4,\"result\":\"ok\"}";
++
++                    return Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "application/json" } }, new CookieCollection(), content));
++                });
++
++            var first = Subject.Test();
++
++            first.Errors.Should().ContainSingle(e => e.ErrorMessage.Contains("Captcha is incorrect"));
++            storedCookies.Should().Contain("__lf_captcha_used", "12345");
++
++            // A new instance gets the settings, including the rejected captcha, from the database.
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "12345";
++            Subject.Cookies = null;
++
++            var second = Subject.Test();
++
++            second.Errors.Should().ContainSingle(e => e.ErrorMessage.Contains("requires a captcha"));
++            client.Verify(
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => (v.GetContent() ?? string.Empty).Contains("captcha=12345")), Subject.Definition),
++                Times.Once());
++        }
++
++        [Test]
++        public void should_submit_a_new_captcha_after_a_used_one()
++        {
++            ((LostFilmSettings)Subject.Definition.Settings).Captcha = "67890";
++
++            IDictionary<string, string> storedCookies = new Dictionary<string, string> { { "__lf_captcha_used", "12345" } };
++
++            var statusService = Mocker.GetMock<IIndexerStatusService>();
++            statusService.Setup(s => s.UpdateCookies(It.IsAny<int>(), It.IsAny<IDictionary<string, string>>(), It.IsAny<DateTime?>()))
++                .Callback((int id, IDictionary<string, string> cookies, DateTime? expiration) => storedCookies = cookies);
++            statusService.Setup(s => s.GetIndexerCookies(It.IsAny<int>())).Returns(() => storedCookies);
++            statusService.Setup(s => s.GetIndexerCookiesExpirationDate(It.IsAny<int>())).Returns(() => DateTime.Now.AddDays(30));
++
++            const string anonPage = "<html><body><a href=\"/login\" class=\"link\">Вход</a></body></html>";
++            const string authedPage = "<html><body><div class=\"row\"></div></body></html>";
++
++            var client = Mocker.GetMock<IIndexerHttpClient>();
++            var newRequestCount = 0;
++            client.Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Path == "/new"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), ++newRequestCount == 1 ? anonPage : authedPage)));
++
++            var loginCookies = new CookieCollection { new Cookie("lf_session", "NEWSESSION", "/") { Expires = DateTime.Now.AddYears(1) } };
++            MockResponse(HttpMethod.Post, "/ajaxik.php", "{\"success\":true,\"result\":\"ok\"}", loginCookies, "application/json");
++
++            var result = Subject.Test();
++
++            result.IsValid.Should().BeTrue();
++            client.Verify(
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => (v.GetContent() ?? string.Empty).Contains("captcha=67890")), Subject.Definition),
++                Times.Once());
++            storedCookies.Should().Contain("__lf_captcha_used", "67890");
++        }
++
+         [Test]
+         public async Task should_skip_extras_block_during_season_scoped_search()
+         {
