@@ -1,0 +1,65 @@
+diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+index 66709d47f..f4e7b7219 100644
+--- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
++++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+@@ -111,6 +111,60 @@ public async Task should_parse_episode_releases_from_LostFilm()
+             torrentInfo.Categories.Should().ContainSingle();
+         }
+ 
++        [Test]
++        public async Task should_attach_the_search_response_so_history_records_success()
++        {
++            // History and the indexer stats count a query as successful only when its result
++            // carries an HTTP 200 response; without one every LostFilm search showed as failed.
++            MockAllResponses();
++
++            var result = await Subject.Fetch(new TvSearchCriteria { SearchTerm = "breaking bad", Season = 5, Episode = "16", Categories = new[] { 5000 } });
++
++            result.Releases.Should().HaveCount(3);
++            result.Queries.Should().ContainSingle();
++            result.Queries[0].Response.Should().NotBeNull();
++            result.Queries[0].Response.StatusCode.Should().Be(HttpStatusCode.OK);
++            result.Queries[0].Response.Request.Url.Path.Should().Be("/ajaxik.php");
++        }
++
++        [Test]
++        public async Task should_attach_the_feed_response_for_rss()
++        {
++            Mocker.GetMock<IIndexerHttpClient>()
++                .Setup(o => o.ExecuteProxiedAsync(It.IsAny<HttpRequest>(), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), "<html><body></body></html>")));
++
++            var result = await Subject.Fetch(new BasicSearchCriteria());
++
++            result.Queries.Should().ContainSingle();
++            result.Queries[0].Response.Should().NotBeNull();
++            result.Queries[0].Response.StatusCode.Should().Be(HttpStatusCode.OK);
++            result.Queries[0].Response.Request.Url.Path.Should().Be("/new");
++        }
++
++        [Test]
++        public async Task should_report_the_time_of_the_whole_query()
++        {
++            // A LostFilm query is several requests; the reported time must cover all of them,
++            // not only the first search request.
++            MockAllResponses();
++
++            Mocker.GetMock<IIndexerHttpClient>()
++                .Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Path == "/V/"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>(async (r, d) =>
++                {
++                    await Task.Delay(200);
++
++                    return new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), ReadAllText(@"Files/Indexers/LostFilm/tracker_bb.html"));
++                });
++
++            var result = await Subject.Fetch(new TvSearchCriteria { SearchTerm = "breaking bad", Season = 5, Episode = "16", Categories = new[] { 5000 } });
++
++            result.Releases.Should().HaveCount(3);
++            result.Queries[0].Response.ElapsedTime.Should().BeGreaterThanOrEqualTo(150);
++        }
++
+         [Test]
+         public void should_use_half_second_rate_limit()
+         {

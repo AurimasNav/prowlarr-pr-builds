@@ -1,0 +1,164 @@
+diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+index 66709d47f..f4e7b7219 100644
+--- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
++++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
+@@ -111,6 +111,60 @@ public async Task should_parse_episode_releases_from_LostFilm()
+             torrentInfo.Categories.Should().ContainSingle();
+         }
+ 
++        [Test]
++        public async Task should_attach_the_search_response_so_history_records_success()
++        {
++            // History and the indexer stats count a query as successful only when its result
++            // carries an HTTP 200 response; without one every LostFilm search showed as failed.
++            MockAllResponses();
++
++            var result = await Subject.Fetch(new TvSearchCriteria { SearchTerm = "breaking bad", Season = 5, Episode = "16", Categories = new[] { 5000 } });
++
++            result.Releases.Should().HaveCount(3);
++            result.Queries.Should().ContainSingle();
++            result.Queries[0].Response.Should().NotBeNull();
++            result.Queries[0].Response.StatusCode.Should().Be(HttpStatusCode.OK);
++            result.Queries[0].Response.Request.Url.Path.Should().Be("/ajaxik.php");
++        }
++
++        [Test]
++        public async Task should_attach_the_feed_response_for_rss()
++        {
++            Mocker.GetMock<IIndexerHttpClient>()
++                .Setup(o => o.ExecuteProxiedAsync(It.IsAny<HttpRequest>(), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>((r, d) =>
++                    Task.FromResult(new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), "<html><body></body></html>")));
++
++            var result = await Subject.Fetch(new BasicSearchCriteria());
++
++            result.Queries.Should().ContainSingle();
++            result.Queries[0].Response.Should().NotBeNull();
++            result.Queries[0].Response.StatusCode.Should().Be(HttpStatusCode.OK);
++            result.Queries[0].Response.Request.Url.Path.Should().Be("/new");
++        }
++
++        [Test]
++        public async Task should_report_the_time_of_the_whole_query()
++        {
++            // A LostFilm query is several requests; the reported time must cover all of them,
++            // not only the first search request.
++            MockAllResponses();
++
++            Mocker.GetMock<IIndexerHttpClient>()
++                .Setup(o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Get && v.Url.Path == "/V/"), Subject.Definition))
++                .Returns<HttpRequest, IndexerDefinition>(async (r, d) =>
++                {
++                    await Task.Delay(200);
++
++                    return new HttpResponse(r, new HttpHeader { { "Content-Type", "text/html" } }, new CookieCollection(), ReadAllText(@"Files/Indexers/LostFilm/tracker_bb.html"));
++                });
++
++            var result = await Subject.Fetch(new TvSearchCriteria { SearchTerm = "breaking bad", Season = 5, Episode = "16", Categories = new[] { 5000 } });
++
++            result.Releases.Should().HaveCount(3);
++            result.Queries[0].Response.ElapsedTime.Should().BeGreaterThanOrEqualTo(150);
++        }
++
+         [Test]
+         public void should_use_half_second_rate_limit()
+         {
+diff --git a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
+index 49f9a53ba..396c794fa 100644
+--- a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
++++ b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
+@@ -1,5 +1,6 @@
+ using System;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.Globalization;
+ using System.Linq;
+ using System.Net;
+@@ -393,20 +394,25 @@ protected override async Task<IndexerQueryResult> FetchPage(IndexerRequest reque
+             var urlQuery = HttpUtility.ParseQueryString(request.HttpRequest.Url.Query);
+             var isRss = request.HttpRequest.Url.Path.Equals("/new", StringComparison.OrdinalIgnoreCase);
+ 
+-            IList<ReleaseInfo> releases;
++            var stopwatch = Stopwatch.StartNew();
+ 
+-            if (isRss)
+-            {
+-                releases = await FetchNewReleases();
+-            }
+-            else
+-            {
+-                releases = await PerformSearch(urlQuery["val"], urlQuery["season"].ParseInt32(), urlQuery["episode"]);
+-            }
++            var (releases, response) = isRss
++                ? await FetchNewReleases()
++                : await PerformSearch(urlQuery["val"], urlQuery["season"].ParseInt32(), urlQuery["episode"]);
++
++            stopwatch.Stop();
+ 
+             return new IndexerQueryResult
+             {
+-                Releases = releases
++                Releases = releases,
++
++                // History and the indexer stats count a query as successful only when it carries an
++                // HTTP 200 response, and take its time from that response. A LostFilm query is several
++                // requests, so report the first one (the search or the feed page) with the time of
++                // the whole query; without it every LostFilm query was recorded as failed.
++                Response = response == null
++                    ? null
++                    : new HttpResponse(response.Request, response.Headers, response.Cookies, response.ResponseData, stopwatch.ElapsedMilliseconds, response.StatusCode, response.Version)
+             };
+         }
+ 
+@@ -865,7 +871,7 @@ private static int GetRelevanceScore(JToken series, IReadOnlyList<string> inform
+             return informativeTokens.Sum(token => haystacks.Any(h => h.Contains(token, StringComparison.Ordinal)) ? 1 : 0);
+         }
+ 
+-        private async Task<IList<ReleaseInfo>> PerformSearch(string searchTerm, int? season, string episode)
++        private async Task<(IList<ReleaseInfo> Releases, HttpResponse Response)> PerformSearch(string searchTerm, int? season, string episode)
+         {
+             if (searchTerm.IsNullOrWhiteSpace())
+             {
+@@ -874,6 +880,7 @@ private async Task<IList<ReleaseInfo>> PerformSearch(string searchTerm, int? sea
+ 
+             _logger.Debug("PerformSearch: {0} [Season: {1}, Episode: {2}]", searchTerm, season, episode);
+             var releases = new List<ReleaseInfo>();
++            HttpResponse firstResponse = null;
+ 
+             // Search query words. Consists of Series keywords that will be used for series search request,
+             // and Episode keywords that will be used for episode filtering.
+@@ -898,6 +905,7 @@ private async Task<IList<ReleaseInfo>> PerformSearch(string searchTerm, int? sea
+                     .AddFormParameter("val", searchString);
+ 
+                 var response = await GetResponse(requestBuilder);
++                firstResponse ??= response;
+ 
+                 try
+                 {
+@@ -944,7 +952,7 @@ private async Task<IList<ReleaseInfo>> PerformSearch(string searchTerm, int? sea
+             }
+             while (--searchKeywords > 0);
+ 
+-            return releases;
++            return (releases, firstResponse);
+         }
+ 
+         private List<JToken> ParseMatchingSeries(HttpResponse response, string searchString, IReadOnlyList<string> informativeTokens)
+@@ -1035,7 +1043,7 @@ private async Task<List<ReleaseInfo>> FetchEpisodesWithFilterFallbackAsync(strin
+             return releases;
+         }
+ 
+-        private async Task<IList<ReleaseInfo>> FetchNewReleases()
++        private async Task<(IList<ReleaseInfo> Releases, HttpResponse Response)> FetchNewReleases()
+         {
+             var url = BaseUrl + "/new";
+             _logger.Debug("FetchNewReleases: " + url);
+@@ -1060,7 +1068,7 @@ private async Task<IList<ReleaseInfo>> FetchNewReleases()
+                 releases.AddRange(await FetchEpisodeReleases(episodeUrl));
+             }
+ 
+-            return releases;
++            return (releases, response);
+         }
+ 
+         private async Task<List<ReleaseInfo>> FetchEpisodeReleases(string url)
