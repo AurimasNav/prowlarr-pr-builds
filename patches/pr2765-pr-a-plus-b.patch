@@ -1,5 +1,5 @@
 diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
-index 66709d47f..d9cf583ab 100644
+index 66709d47f..bd3985d6c 100644
 --- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
 +++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
 @@ -492,6 +492,149 @@ public async Task should_fallback_to_mirror_when_primary_is_geo_blocked()
@@ -152,7 +152,7 @@ index 66709d47f..d9cf583ab 100644
          [Test]
          public void should_advertise_tv_and_movie_categories()
          {
-@@ -914,5 +1057,33 @@ public async Task should_not_throw_when_episode_date_text_has_marker_out_of_orde
+@@ -914,5 +1057,32 @@ public async Task should_not_throw_when_episode_date_text_has_marker_out_of_orde
              result.Releases.Should().NotBeEmpty();
              result.Releases.Should().OnlyContain(r => r.PublishDate > DateTime.Now.AddMinutes(-1));
          }
@@ -183,7 +183,6 @@ index 66709d47f..d9cf583ab 100644
 +        {
 +            LostFilm.ParseRussianDate(text).Should().BeNull();
 +        }
-+
      }
  }
 diff --git a/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs b/src/NzbDrone.Core/Indexers/Definitions/LostFilm.cs
