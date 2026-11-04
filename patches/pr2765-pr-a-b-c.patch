@@ -1,5 +1,5 @@
 diff --git a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
-index 66709d47f..6ce733e44 100644
+index 66709d47f..7b8b4987d 100644
 --- a/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
 +++ b/src/NzbDrone.Core.Test/IndexerTests/LostFilmTests/LostFilmFixture.cs
 @@ -492,6 +492,149 @@ public async Task should_fallback_to_mirror_when_primary_is_geo_blocked()
@@ -210,7 +210,7 @@ index 66709d47f..6ce733e44 100644
 +
 +            result.IsValid.Should().BeTrue();
 +            client.Verify(
-+                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => (v.GetContent() ?? string.Empty).Contains("captcha=")), Subject.Definition),
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && (v.GetContent() ?? string.Empty).Contains("captcha=")), Subject.Definition),
 +                Times.Never());
 +
 +            // Still remembered after the new login, so the stored captcha is never tried later either.
@@ -270,7 +270,7 @@ index 66709d47f..6ce733e44 100644
 +
 +            second.Errors.Should().ContainSingle(e => e.ErrorMessage.Contains("requires a captcha"));
 +            client.Verify(
-+                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => (v.GetContent() ?? string.Empty).Contains("captcha=12345")), Subject.Definition),
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && (v.GetContent() ?? string.Empty).Contains("captcha=12345")), Subject.Definition),
 +                Times.Once());
 +        }
 +
@@ -303,7 +303,7 @@ index 66709d47f..6ce733e44 100644
 +
 +            result.IsValid.Should().BeTrue();
 +            client.Verify(
-+                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => (v.GetContent() ?? string.Empty).Contains("captcha=67890")), Subject.Definition),
++                o => o.ExecuteProxiedAsync(It.Is<HttpRequest>(v => v.Method == HttpMethod.Post && (v.GetContent() ?? string.Empty).Contains("captcha=67890")), Subject.Definition),
 +                Times.Once());
 +            storedCookies.Should().Contain("__lf_captcha_used", "67890");
 +        }
