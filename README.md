@@ -15,3 +15,11 @@ code, can push the image.
 
 Prowlarr is licensed under GPL-3.0. The source of every image is the Prowlarr branch and PR
 commit named in its labels (`io.github.prowlarr.base-revision`, `org.opencontainers.image.revision`).
+
+## Testing proposed fixes
+
+`patches/<name>.patch` holds a fix proposed to the PR author; run the workflow with `patch: <name>`
+to build the PR with that patch applied on top (the image tag ends in `-<name>-r<run>`).
+
+- `pr2765-lostfilm-fixes`: LostFilm (#2765) reuses the session on the mirror after a geo-block
+  (no re-login with the used captcha) and parses dates without ru-RU culture data.

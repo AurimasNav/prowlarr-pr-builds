@@ -20,12 +20,16 @@ on:
         description: Indexer implementation the PR adds (checked in the image smoke test)
         required: true
         default: LostFilm
+      patch:
+        description: Optional patch from patches/ (name without .patch) applied on top of the PR
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ inputs.pr }}
+  group: build-${{ inputs.pr }}-${{ inputs.patch }}
   cancel-in-progress: false
 
 jobs:
@@ -50,7 +54,8 @@ jobs:
       env:
         PR: ${{ inputs.pr }}
         BASE: ${{ inputs.base }}
-      run: ./builder/scripts/Merge-ProwlarrPr.ps1 -Pr $env:PR -Base $env:BASE -Path prowlarr
+        PATCH: ${{ inputs.patch }}
+      run: ./builder/scripts/Merge-ProwlarrPr.ps1 -Pr $env:PR -Base $env:BASE -Path prowlarr -Patch $env:PATCH
 
     - name: Set up .NET (SDK from Prowlarr's global.json)
       uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
@@ -105,7 +110,8 @@ jobs:
       env:
         PR: ${{ inputs.pr }}
         BASE: ${{ inputs.base }}
-      run: ./builder/scripts/Merge-ProwlarrPr.ps1 -Pr $env:PR -Base $env:BASE -Path prowlarr
+        PATCH: ${{ inputs.patch }}
+      run: ./builder/scripts/Merge-ProwlarrPr.ps1 -Pr $env:PR -Base $env:BASE -Path prowlarr -Patch $env:PATCH
 
     - name: Set up .NET (SDK from Prowlarr's global.json)
       uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
